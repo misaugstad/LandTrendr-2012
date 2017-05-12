@@ -322,27 +322,28 @@ tempsubset=subset
 
 
 	;set up the progress bar:
+	progressbaryesno = 0 ; when parallelized, we are not using prgoress bar
 
 	if progressbaryesno eq 1 then begin
-	progressBar = Obj_New("PROGRESSBAR", /fast_loop, title = 'Curve-fitting:  percent done')
-	progressBar -> Start
+		progressBar = Obj_New("PROGRESSBAR", /fast_loop, title = 'Curve-fitting:  percent done')
+		progressBar -> Start
 	end
 
-	vertyear_image = intarr(sz[0], sz[1], output_image_group[0].n_layers)
-	vertvals_image = intarr(sz[0], sz[1], output_image_group[1].n_layers)
-	mag_image = intarr(sz[0], sz[1],output_image_group[2].n_layers)
-	dur_image = intarr(sz[0], sz[1], output_image_group[3].n_layers)
-	distrec_image = intarr(sz[0], sz[1], output_image_group[4].n_layers)
+	; Instead of initializing here, we are initializing as shared memory
+	; vertyear_image = intarr(sz[0], sz[1], output_image_group[0].n_layers)
+	; vertvals_image = intarr(sz[0], sz[1], output_image_group[1].n_layers)
+	; mag_image = intarr(sz[0], sz[1],output_image_group[2].n_layers)
+	; dur_image = intarr(sz[0], sz[1], output_image_group[3].n_layers)
+	; distrec_image = intarr(sz[0], sz[1], output_image_group[4].n_layers)
 
-	fitted_image = intarr(sz[0], sz[1], output_image_group[5].n_layers)
-	stats_image = intarr(sz[0], sz[1], output_image_group[6].n_layers)
+	; fitted_image = intarr(sz[0], sz[1], output_image_group[5].n_layers)
+	; stats_image = intarr(sz[0], sz[1], output_image_group[6].n_layers)
 
-	segmse_image = intarr(sz[0], sz[1], output_image_group[7].n_layers)
-	source_image = intarr(sz[0], sz[1], output_image_group[8].n_layers)
-	segmean_image = intarr(sz[0], sz[1], output_image_group[9].n_layers)
+	; segmse_image = intarr(sz[0], sz[1], output_image_group[7].n_layers)
+	; source_image = intarr(sz[0], sz[1], output_image_group[8].n_layers)
+	; segmean_image = intarr(sz[0], sz[1], output_image_group[9].n_layers)
 
 	totalcount = float(sz[0]*sz[1])
-
 
 	ksq=kernelsize^2
 	seed= randomseed()
@@ -350,151 +351,233 @@ tempsubset=subset
 
 	offset = (kernelsize-1)/2
 
+	; If our current chunk contains anything in the usearea mask, then we split
+	; the data by rows and run in parallel in child processes. Otherwise, we
+	; skip this process altogether.
+	; The progress bar feature is currently not implemented in parallel version.
+	if TOTAL(mask_img) > 0 then begin
+		nCPUs = !CPU.HW_NCPU-1
 
+		; map some anonymous shared memory into into our address space
+		SHMMAP, 'seg_cld_img', /INTEGER, DIMENSION=[SIZE(cld_img, /DIMENSIONS)]
+		SHMMAP, 'seg_img', /INTEGER, DIMENSION=SIZE(img, /DIMENSIONS)
+		SHMMAP, 'seg_mask_img', /INTEGER, DIMENSION=SIZE(mask_img, /DIMENSIONS)
+		SHMMAP, 'seg_fitted_image', /INTEGER, DIMENSION=[sz[0], sz[1], output_image_group[5].n_layers]
+		SHMMAP, 'seg_source_image', /INTEGER, DIMENSION=[sz[0], sz[1], output_image_group[8].n_layers]
+		SHMMAP, 'seg_vertyear_image', /INTEGER, DIMENSION=[sz[0], sz[1], output_image_group[0].n_layers]
+		SHMMAP, 'seg_vertvals_image', /INTEGER, DIMENSION=[sz[0], sz[1], output_image_group[1].n_layers]
+		SHMMAP, 'seg_segmse_image', /INTEGER, DIMENSION=[sz[0], sz[1], output_image_group[7].n_layers]
+		SHMMAP, 'seg_segmean_image', /INTEGER, DIMENSION=[sz[0], sz[1], output_image_group[9].n_layers]
+		SHMMAP, 'seg_mag_image', /INTEGER, DIMENSION=[sz[0], sz[1],output_image_group[2].n_layers]
+		SHMMAP, 'seg_stats_image', /INTEGER, DIMENSION=[sz[0], sz[1], output_image_group[6].n_layers]
+		SHMMAP, 'seg_dur_image', /INTEGER, DIMENSION=[sz[0], sz[1], output_image_group[3].n_layers]
+		SHMMAP, 'seg_distrec_image', /INTEGER, DIMENSION=[sz[0], sz[1], output_image_group[4].n_layers]
 
-	for x = offset, sz[0]-(offset+1), skipfactor do begin
-		for y = offset, sz[1]-(offset+1), skipfactor do begin
+		; make variables pointing to our different segments in shared memory
+		temp_cld_img = SHMVAR('seg_cld_img')
+		temp_img = SHMVAR('seg_img')
+		temp_mask_img = SHMVAR('seg_mask_img')
+		temp_fitted_image = SHMVAR('seg_fitted_image')
+		temp_source_image = SHMVAR('seg_source_image')
+		temp_vertyear_image = SHMVAR('seg_vertyear_image')
+		temp_vertvals_image = SHMVAR('seg_vertvals_image')
+		temp_segmse_image = SHMVAR('seg_segmse_image')
+		temp_segmean_image = SHMVAR('seg_segmean_image')
+		temp_mag_image = SHMVAR('seg_mag_image')
+		temp_stats_image = SHMVAR('seg_stats_image')
+		temp_dur_image = SHMVAR('seg_dur_image')
+		temp_distrec_image = SHMVAR('seg_distrec_image')
 
-			;check on the mask image to see if we should run this pixel
-			if mask_img[x,y] eq 1 then begin
-				;check for clouds
-				chunk = img[x-offset:x+offset, y-offset:y+offset, *]
-				usable = cld_img[x-offset:x+offset, y-offset:y+offset, *] eq 0
+		; initialize the shared memory with the images that we have in local mem
+		temp_cld_img[0, 0, 0] = cld_img
+		temp_img[0, 0, 0] = img
+		temp_mask_img[0, 0, 0] = mask_img
+		; initialize the rest of the shared memory variables w/ default values
+		temp_fitted_image[0, 0, 0] = intarr(sz[0], sz[1], output_image_group[5].n_layers)
+		temp_source_image[0, 0, 0] = intarr(sz[0], sz[1], output_image_group[8].n_layers)
+		temp_vertyear_image[0, 0, 0] = intarr(sz[0], sz[1], output_image_group[0].n_layers)
+		temp_vertvals_image[0, 0, 0] = intarr(sz[0], sz[1], output_image_group[1].n_layers)
+		temp_segmse_image[0, 0, 0] = intarr(sz[0], sz[1], output_image_group[7].n_layers)
+		temp_segmean_image[0, 0, 0] = intarr(sz[0], sz[1], output_image_group[9].n_layers)
+		temp_mag_image[0, 0, 0] = intarr(sz[0], sz[1],output_image_group[2].n_layers)
+		temp_stats_image[0, 0, 0] = intarr(sz[0], sz[1], output_image_group[6].n_layers)
+		temp_dur_image[0, 0, 0] = intarr(sz[0], sz[1], output_image_group[3].n_layers)
+		temp_distrec_image[0, 0, 0] = intarr(sz[0], sz[1], output_image_group[4].n_layers)
 
-				slice = total(chunk*usable,1)
-				slice_usable = total(usable, 1)
+		; This is the procedure call that does the work inside the loop. It is
+		; in a string so the command can be sent to the child processes.
+		proc_str = 'segment_pixels, start_x, end_x, offset, skipfactor, cld_img, img, ' $
+			+ 'n_fix_doy_effect, pval, minneeded, seed, ' $
+			+ 'minimum_number_years_needed, desawtooth_val, background_val, ' $
+			+ 'recovery_threshold, max_segments, distweightfactor, ' $
+			+ 'vertexcountovershoot, bestmodelproportion, modifier, mask_img, ' $
+			+ 'fitted_image, source_image, vertyear_image, vertvals_image, ' $
+			+ 'juldays, segmse_image, segmean_image, mag_image, stats_image, ' $
+			+ 'dur_image, idx_img, x_axis, distrec_image'
 
-				vals = total(slice,1)/total(slice_usable, 1)
+		; count how many indices are computed and how many for each CPU.
+		if sz[0] > 2*offset then xstodo = 1 + (sz[0] - 2*offset - 1)/skipfactor else xstodo = 0
+		xs_per_cpu = xstodo / nCPUs
 
-				goods= where(cld_img[x,y,*] ne 1, ngds)
-				if ngds gt minimum_number_years_needed then begin
+		oBridge = objarr(nCPUs-1)
+		for i=0, nCPUs-1 do begin
+			; Compute start and end rows for each process, parent process gets
+			; all the leftovers from integer division.
+			start_x = i * xs_per_cpu * skipfactor + offset
+			end_x = start_x + (xs_per_cpu - 1) * skipfactor
+	        if i EQ n_elements(oBridge) then end_x = (sz[0]-(offset+2))
 
+	        ; If the parent process, no need to transfer data, just do the work.
+	        if i EQ nCPUs-1 then begin
+	            segment_pixels, start_x, end_x, offset, skipfactor, temp_cld_img, temp_img, $
+	            	n_elements(fix_doy_effect), pval, minneeded, seed, $
+	            	minimum_number_years_needed, desawtooth_val, background_val, $
+	            	recovery_threshold, max_segments, distweightfactor, vertexcountovershoot, $
+	            	bestmodelproportion, modifier, temp_mask_img, temp_fitted_image, $
+	            	temp_source_image, temp_vertyear_image, temp_vertvals_image, info.julday, $
+	            	temp_segmse_image, temp_segmean_image, temp_mag_image, temp_stats_image, $
+	            	temp_dur_image, idx_image, x_axis, temp_distrec_image
 
-					;first check to see if fix the doy effect
-					if n_elements(fix_doy_effect) ne 0 then begin
+	        ; if child process, transfer data and start the work
+	        endif else begin
+	            oBridge[i] = obj_new('IDL_IDLBridge') ; start up the child process
 
-						idxs = idx_img[x,y,*]
+	            ; pass data (none in this first set are modified)
+	            oBridge[i]->SetVar, 'start_x', start_x
+	            oBridge[i]->SetVar, 'end_x', end_x
+	            oBridge[i]->SetVar, 'offset', offset
+	            oBridge[i]->SetVar, 'skipfactor', skipfactor
+	            oBridge[i]->SetVar, 'n_fix_doy_effect', n_elements(fix_doy_effect)
+	            oBridge[i]->SetVar, 'pval', pval
+	            oBridge[i]->SetVar, 'minneeded', minneeded
+	            oBridge[i]->SetVar, 'seed', seed
+	            oBridge[i]->SetVar, 'minimum_number_years_needed', minimum_number_years_needed
+	            oBridge[i]->SetVar, 'desawtooth_val', desawtooth_val
+	            oBridge[i]->SetVar, 'background_val', background_val
+	            oBridge[i]->SetVar, 'recovery_threshold', recovery_threshold
+	            oBridge[i]->SetVar, 'max_segments', max_segments
+	            oBridge[i]->SetVar, 'distweightfactor', distweightfactor
+	            oBridge[i]->SetVar, 'vertexcountovershoot', vertexcountovershoot
+	            oBridge[i]->SetVar, 'bestmodelproportion', bestmodelproportion
+	            oBridge[i]->SetVar, 'modifier', modifier
+	            oBridge[i]->SetVar, 'x_axis', x_axis
+	            oBridge[i]->SetVar, 'juldays', info.julday
+	            oBridge[i]->SetVar, 'idx_img', idx_img
 
-						uniques = fast_unique(info[idxs[goods]].julday)
-						if n_elements(uniques) gt 4 then begin
-							r = poly_fit(info[idxs[goods]].julday, vals[goods],2, chisq=chisq,yfit = yfit)
-							m = mean(yfit)
-							zzz = calc_fitting_stats3(vals[goods], yfit, 3, resid=resid)
-							if zzz.p_of_f lt pval then outvals = m+resid else $
-								outvals = vals[goods]
-						end else outvals = vals[goods]
-					end else outvals = vals[goods]
-;feb 2013
-            ; dampen the first and last years
-            dampen = 0.7
-            
-            diffend = outvals[ngds-1]-outvals[ngds-2]
-            outvals[ngds-1] = outvals[ngds-2]+ ((1-dampen)*diffend)
-            
-            diffbeg = outvals[0]-outvals[1]
-            outvals[0]=outvals[1]+((1-dampen)*diffbeg)
-            
+	            ; pass dimensions of images in shared memory
+	            oBridge[i]->SetVar, 'fitted_dim', SIZE(temp_fitted_image, /DIMENSIONS)
+	            oBridge[i]->SetVar, 'source_dim', SIZE(temp_source_image, /DIMENSIONS)
+	            oBridge[i]->SetVar, 'vertyear_dim', SIZE(temp_vertyear_image, /DIMENSIONS)
+	            oBridge[i]->SetVar, 'vertvals_dim', SIZE(temp_vertvals_image, /DIMENSIONS)
+	            oBridge[i]->SetVar, 'segmse_dim', SIZE(temp_segmse_image, /DIMENSIONS)
+	            oBridge[i]->SetVar, 'segmean_dim', SIZE(temp_segmean_image, /DIMENSIONS)
+	            oBridge[i]->SetVar, 'mag_dim', SIZE(temp_mag_image, /DIMENSIONS)
+	            oBridge[i]->SetVar, 'stats_dim', SIZE(temp_stats_image, /DIMENSIONS)
+	            oBridge[i]->SetVar, 'distrec_dim', SIZE(temp_distrec_image, /DIMENSIONS)
+	            oBridge[i]->SetVar, 'dur_dim', SIZE(temp_dur_image, /DIMENSIONS)
+	            oBridge[i]->SetVar, 'cloud_dim', SIZE(temp_cld_img, /DIMENSIONS)
+	            oBridge[i]->SetVar, 'img_dim', SIZE(temp_img, /DIMENSIONS)
+	            oBridge[i]->SetVar, 'mask_dim', SIZE(temp_mask_img, /DIMENSIONS)
 
-					ok=fit_trajectory_v2(x_axis,goods, outvals, $
-						minneeded, background_val, $
-						modifier, seed, $
-						desawtooth_val, pval, $
-						max_segments, recovery_threshold, $
-						distweightfactor,  vertexcountovershoot, $
-    					bestmodelproportion)
+	            ; map addresses of images in anon shared memory into each child's address space.
+	            oBridge[i]->Execute, "SHMMAP, 'seg_cld_img', /INTEGER, DIMENSION=cloud_dim"
+	            oBridge[i]->Execute, "SHMMAP, 'seg_img', /INTEGER, DIMENSION=img_dim"
+	            oBridge[i]->Execute, "SHMMAP, 'seg_mask_img', /INTEGER, DIMENSION=mask_dim"
+	            oBridge[i]->Execute, "SHMMAP, 'seg_fitted_image', /INTEGER, DIMENSION=fitted_dim"
+	            oBridge[i]->Execute, "SHMMAP, 'seg_source_image', /INTEGER, DIMENSION=source_dim"
+	            oBridge[i]->Execute, "SHMMAP, 'seg_vertyear_image', /INTEGER, DIMENSION=vertyear_dim"
+	            oBridge[i]->Execute, "SHMMAP, 'seg_vertvals_image', /INTEGER, DIMENSION=vertvals_dim"
+	            oBridge[i]->Execute, "SHMMAP, 'seg_segmse_image', /INTEGER, DIMENSION=segmse_dim"
+	            oBridge[i]->Execute, "SHMMAP, 'seg_segmean_image', /INTEGER, DIMENSION=segmean_dim"
+	            oBridge[i]->Execute, "SHMMAP, 'seg_mag_image', /INTEGER, DIMENSION=mag_dim"
+	            oBridge[i]->Execute, "SHMMAP, 'seg_stats_image', /INTEGER, DIMENSION=stats_dim"
+	            oBridge[i]->Execute, "SHMMAP, 'seg_distrec_image', /INTEGER, DIMENSION=distrec_dim"
+	            oBridge[i]->Execute, "SHMMAP, 'seg_dur_image', /INTEGER, DIMENSION=dur_dim"
 
+	            ; Create local variables in each child process pointing to  images in shared memory.
+	            oBridge[i]->Execute, "cld_img = SHMVAR('seg_cld_img')"
+	            oBridge[i]->Execute, "img = SHMVAR('seg_img')"
+	            oBridge[i]->Execute, "mask_img = SHMVAR('seg_mask_img')"
+	            oBridge[i]->Execute, "fitted_image = SHMVAR('seg_fitted_image')"
+	            oBridge[i]->Execute, "source_image = SHMVAR('seg_source_image')"
+	            oBridge[i]->Execute, "vertyear_image = SHMVAR('seg_vertyear_image')"
+	            oBridge[i]->Execute, "vertvals_image = SHMVAR('seg_vertvals_image')"
+	            oBridge[i]->Execute, "segmse_image = SHMVAR('seg_segmse_image')"
+	            oBridge[i]->Execute, "segmean_image = SHMVAR('seg_segmean_image')"
+	            oBridge[i]->Execute, "mag_image = SHMVAR('seg_mag_image')"
+	            oBridge[i]->Execute, "stats_image = SHMVAR('seg_stats_image')"
+	            oBridge[i]->Execute, "distrec_image = SHMVAR('seg_distrec_image')"
+	            oBridge[i]->Execute, "dur_image = SHMVAR('seg_dur_image')"
 
-					if ok.ok eq 1 then begin
-						;take out the bad year
-						;fitted_image[x,y,*] = round(ok.best_model.yfit[uniq(info.year)])	;all years, including masked out, will get fittedvals
-						fitted_image[x,y,*] = round(ok.best_model.yfit)	;prior version's line (commented, above) resulted in flatline at end
-												;because of illogic -- all of the yfits belong in the fitted image
-;plot, x_axis[goods], outvals, psym = 4
-;oplot, x_axis, round(ok.best_model.yfit), color = '444499'xl
-;qqw = get_kbrd()
+	            ; Compile the function that processes pixels and run it. The nowait keyword means
+	            ; this child process doesn't have to finish executing before moving on, so work can
+	            ; be done in parallel.
+	            oBridge[i]->Execute, ".r segment_pixels.pro"
+	            oBridge[i]->Execute, proc_str, /nowait
+	        endelse
+	    endfor
 
+	    ; Wait for all child processes to finish executing...
+	    notdone = 1
+	    while notdone do begin
+	        done=0
+	        for i=0, n_elements(oBridge)-1 do $
+	            done = done+oBridge[i]->Status()
+	        if done EQ 0 then notdone=done
+	    endwhile
 
-					    source_image[x,y,goods] = outvals	;
+	    ; Once everyone is done, stop the child processes.
+	    for i=0, n_elements(oBridge)-1 do begin
+	        obj_destroy, oBridge[n_elements(oBridge)-1-i]
+	    endfor
 
+	    ; Copy data from shared memory over into local memory so it can be released.
+	    ; TODO Remove this copying. It is not necessary. Right now we are doing it because string
+	    ;      literals are being passed to SHMMAP, and if we don't copy the data over, then the
+	    ;      mapped memory's name clashes when you get to a 2nd chunk. We can make it more general
+	    ;      where SHMMAP creates a unique name for us, which we can save in a variable, instead
+	    ;      of using the same string literal every time.
+		vertyear_image = temp_vertyear_image
+		vertvals_image = temp_vertvals_image
+		mag_image = temp_mag_image
+		dur_image = temp_dur_image
+		distrec_image = temp_distrec_image
+		fitted_image = temp_fitted_image
+		stats_image = temp_stats_image
+		segmse_image = temp_segmse_image
+		source_image = temp_source_image
+		segmean_image = temp_segmean_image
 
+	    ; Then make the addresses no longer shared.
+		SHMUNMAP, 'seg_cld_img'
+		SHMUNMAP, 'seg_img'
+		SHMUNMAP, 'seg_mask_img'
+		SHMUNMAP, 'seg_fitted_image'
+		SHMUNMAP, 'seg_source_image'
+		SHMUNMAP, 'seg_vertyear_image'
+		SHMUNMAP, 'seg_vertvals_image'
+		SHMUNMAP, 'seg_segmse_image'
+		SHMUNMAP, 'seg_segmean_image'
+		SHMUNMAP, 'seg_mag_image'
+		SHMUNMAP, 'seg_stats_image'
+		SHMUNMAP, 'seg_dur_image'
+		SHMUNMAP, 'seg_distrec_image'
 
-						vertyear_image[x,y,*] = ok.best_model.vertices		;these are true years
-						vertvals_image[x,y,*] = ok.best_model.vertvals		;in the units fed to fit_trajectory_v1
-						segmse_image[x,y,*] = ok.best_model.segment_mse		;mse of each segment
-						for ss = 0, ok.best_model.n_segments-1 do $			;mean of each segment
-								segmean_image[x,y,ss] = (vertvals_image[x,y,ss]+vertvals_image[x,y,ss+1])/2.
+	endif else begin
+		; If we don't spawn other processes, at least initialize in private memory.
+		vertyear_image = intarr(sz[0], sz[1], output_image_group[0].n_layers)
+		vertvals_image = intarr(sz[0], sz[1], output_image_group[1].n_layers)
+		mag_image = intarr(sz[0], sz[1],output_image_group[2].n_layers)
+		dur_image = intarr(sz[0], sz[1], output_image_group[3].n_layers)
+		distrec_image = intarr(sz[0], sz[1], output_image_group[4].n_layers)
 
-						;get the magnitudes and the proportions
-						temp = shift(ok.best_model.vertvals, -1) - ok.best_model.vertvals
-						mag_image[x,y,0:ok.best_model.n_segments-1] = temp[0:ok.best_model.n_segments-1]
+		fitted_image = intarr(sz[0], sz[1], output_image_group[5].n_layers)
+		stats_image = intarr(sz[0], sz[1], output_image_group[6].n_layers)
 
-						maxdist = max(mag_image[x,y,0:ok.best_model.n_segments-1], min=maxrec)
-						distrec_image[x,y, 0]=max([maxdist,0])
-						distrec_image[x,y, 1]=min([maxrec, 0])
-
-
-
-						totalmag = total(abs(mag_image[x,y, *]))	;the total distance traversed, up or down
-						summag = float(total(mag_image[x,y, *]))			;the actual value with pluses and minuses
-						if totalmag eq 0 then distrec_image[x,y, 2] = (-1500) else $
-							distrec_image[x,y, 2] = (summag/totalmag)*1000	;will be -1000 if all rec, + 1000 if all dist
-
-						;get the durations
-						temp = shift(ok.best_model.vertices, -1) - ok.best_model.vertices
-
-						dur_image[x,y,0:ok.best_model.n_segments-1] = temp[0:ok.best_model.n_segments-1]
-
-
-						;					mag_image[x,y,*] =
-						;					 = intarr(sz[0], sz[1], max_segments)
-						;			distrec_image = intarr(sz[0], sz[1], max_segments)
-
-
-
-
-						if ok.best_model.f_stat gt 300 then ok.best_model.f_stat = 300
-						stats_image[x,y,0] = round(ok.best_model.p_of_f*100)
-						stats_image[x,y,1] = round(ok.best_model.f_stat*100)
-						stats_image[x,y,2] = round(ok.best_model.ms_regr/10.)
-						stats_image[x,y,3] = round(ok.best_model.ms_resid/10.)
-						stats_image[x,y,4] = 1			;directly run?
-						stats_image[x,y,5] = ok.best_model.n_segments
-						stats_image[x,y,6] = x_axis[goods[0]]	;set to minimum usable year
-						stats_image[x,y,7] = n_elements(goods)	;number of usable years
-						;stats_image layers 8 and 9 are used only for interpolation, giving the offset of the pixel
-					end
-				end
-
-
-
-			end
-
-			if progressbaryesno eq 1 then begin
-				if progressBar -> CheckCancel() then begin
-				;progressBar -> destroy
-				print, 'x and y', string(x)+string(y)
-				stop
-			;    return, {ok:0}
-			 end
-			end
-
-		end ;y
- ;update the progress meeter
-  
- 
-
-		percent_done = ((float(x)*y)/ totalcount) * 100
-		
-  test = round((percent_done) / progressinc)
-  if test gt progressval then begin
-      print, progressval*progressinc  ;only print if we've bumped to next increment
-      progressval = test
-      end
-		if progressbaryesno eq 1 then progressBar -> Update, percent_done
-		
-		
-		
-	end		;x
+		segmse_image = intarr(sz[0], sz[1], output_image_group[7].n_layers)
+		source_image = intarr(sz[0], sz[1], output_image_group[8].n_layers)
+		segmean_image = intarr(sz[0], sz[1], output_image_group[9].n_layers)
+	endelse
 
 
 	if progressbaryesno eq 1 then begin 
